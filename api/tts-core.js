@@ -1,7 +1,8 @@
 // TTS 代理核心逻辑（纯 Web API，Node 与 Edge 运行时通用）
-// Naver Clova 整句优先，有道词典词条兜底
+// Naver Clova 整句优先，百度翻译发音兜底（免 key、国内可达），有道词典词条最后兜底
 
 const NAVER = 'https://dict.naver.com/api/nvoice'
+const BAIDU = 'https://fanyi.baidu.com/gettts'
 const YOUDAO = 'https://dict.youdao.com/dictvoice'
 const BROWSER_UA =
   'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36'
@@ -13,7 +14,10 @@ const NAVER_SPEAKERS = {
   zh: { f: 'meimei', m: 'liangliang' },
 }
 
-const NAVER_MAX_CHARS = 100
+const NAVER_MAX_CHARS = 800
+
+// 百度翻译发音接口的语言代码
+const BAIDU_LAN = { ko: 'kor', en: 'en', ja: 'jp', zh: 'zh' }
 
 function chunkText(text, maxLen) {
   if (text.length <= maxLen) return [text]
@@ -96,9 +100,34 @@ async function fetchYoudao(text, le) {
   }
 }
 
+async function fetchBaidu(text, le) {
+  const lan = BAIDU_LAN[le]
+  if (!lan) return null
+  try {
+    const res = await fetch(
+      `${BAIDU}?lan=${lan}&text=${encodeURIComponent(text)}&spd=3&source=web`,
+      {
+        headers: { 'User-Agent': BROWSER_UA },
+        signal: AbortSignal.timeout(12000),
+      },
+    )
+    if (!res.ok) return null
+    const type = res.headers.get('content-type') ?? ''
+    if (!type.includes('audio')) return null
+    const buf = new Uint8Array(await res.arrayBuffer())
+    return buf.length < 500 ? null : buf
+  } catch {
+    return null
+  }
+}
+
 /** 返回 MP3 字节；拿不到返回 null */
 export async function getTtsAudio(text, le, gender) {
-  return (await fetchNaver(text, le, gender)) ?? (await fetchYoudao(text, le))
+  return (
+    (await fetchNaver(text, le, gender)) ??
+    (await fetchBaidu(text, le)) ??
+    (await fetchYoudao(text, le))
+  )
 }
 
 export function parseTtsParams(requestUrl) {

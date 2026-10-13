@@ -8,9 +8,11 @@ import { readFile } from 'node:fs/promises'
 import { extname, join, normalize } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import os from 'node:os'
+import { getTtsAudio, parseTtsParams } from './api/tts-core.js'
 
 const ROOT = join(fileURLToPath(import.meta.url), '..', 'dist')
-const PORT = 7200
+// 可用 PORT 环境变量换端口（如本机 7200 被占用时：PORT=7300 npm run phone）
+const PORT = Number(process.env.PORT) || 7200
 
 const MIME = {
   '.html': 'text/html; charset=utf-8',
@@ -25,101 +27,16 @@ const MIME = {
   '.webmanifest': 'application/manifest+json',
 }
 
-// ---------- 发音代理（Naver 整句优先，有道词条兜底） ----------
-
-const NAVER = 'https://dict.naver.com/api/nvoice'
-const YOUDAO = 'https://dict.youdao.com/dictvoice'
-const BROWSER_UA =
-  'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36'
-
-const NAVER_SPEAKERS = {
-  ko: { f: 'kyuri', m: 'jinho' },
-  ja: { f: 'yuri', m: 'shinji' },
-  en: { f: 'danna', m: 'matt' },
-  zh: { f: 'meimei', m: 'liangliang' },
-}
-
-const NAVER_MAX_CHARS = 100
-
-function chunkText(text, maxLen) {
-  if (text.length <= maxLen) return [text]
-  const parts = text.split(/(?<=[。！？!?；;.，,、\n])|(?<=\s)/)
-  const out = []
-  let cur = ''
-  for (const p of parts) {
-    if (cur && (cur + p).length > maxLen) {
-      out.push(cur)
-      cur = p
-    } else {
-      cur += p
-    }
-    while (cur.length > maxLen) {
-      out.push(cur.slice(0, maxLen))
-      cur = cur.slice(maxLen)
-    }
-  }
-  if (cur.trim()) out.push(cur)
-  return out
-}
-
-function stripId3(buf) {
-  if (buf.length > 10 && buf.toString('latin1', 0, 3) === 'ID3') {
-    const size =
-      ((buf[6] & 0x7f) << 21) |
-      ((buf[7] & 0x7f) << 14) |
-      ((buf[8] & 0x7f) << 7) |
-      (buf[9] & 0x7f)
-    return buf.subarray(10 + size)
-  }
-  return buf
-}
-
-async function fetchNaver(text, le, gender) {
-  const speaker = NAVER_SPEAKERS[le]?.[gender] ?? NAVER_SPEAKERS[le]?.f
-  if (!speaker) return null
-  try {
-    const bufs = []
-    for (const part of chunkText(text, NAVER_MAX_CHARS)) {
-      const url = `${NAVER}?service=dictionary&speech_fmt=mp3&speaker=${speaker}&speed=0&text=${encodeURIComponent(part)}`
-      const res = await fetch(url, {
-        headers: { Referer: 'https://papago.naver.com/', 'User-Agent': BROWSER_UA },
-        signal: AbortSignal.timeout(12000),
-      })
-      if (!res.ok) return null
-      const buf = Buffer.from(await res.arrayBuffer())
-      if (buf.length < 500) return null
-      bufs.push(bufs.length === 0 ? buf : stripId3(buf))
-    }
-    return Buffer.concat(bufs)
-  } catch {
-    return null
-  }
-}
-
-async function fetchYoudao(text, le) {
-  try {
-    const res = await fetch(
-      `${YOUDAO}?audio=${encodeURIComponent(text)}&le=${le}`,
-      { signal: AbortSignal.timeout(12000) },
-    )
-    if (!res.ok) return null
-    const buf = Buffer.from(await res.arrayBuffer())
-    return buf.length < 500 ? null : buf
-  } catch {
-    return null
-  }
-}
+// ---------- 发音代理（逻辑见 api/tts-core.js：Naver 整句 → 百度 → 有道词条） ----------
 
 async function handleTts(url, res) {
-  const text = url.searchParams.get('text')?.slice(0, 1000)
-  const le = url.searchParams.get('le')
-  const gender = url.searchParams.get('gender') === 'm' ? 'm' : 'f'
-  if (!text || !le || !/^(ko|en|ja|zh)$/.test(le)) {
+  const params = parseTtsParams(`http://localhost${url.pathname}${url.search}`)
+  if (!params) {
     res.writeHead(400)
     res.end('bad request')
     return
   }
-  const buf = (await fetchNaver(text, le, gender)) ?? (await fetchYoudao(text, le))
+  const buf = await getTtsAudio(params.text, params.le, params.gender)
   if (!buf) {
     res.writeHead(502)
     res.end('upstream error')
@@ -129,7 +46,7 @@ async function handleTts(url, res) {
     'Content-Type': 'audio/mpeg',
     'Cache-Control': 'public, max-age=31536000',
   })
-  res.end(buf)
+  res.end(Buffer.from(buf))
 }
 
 // ---------- 静态服务 ----------

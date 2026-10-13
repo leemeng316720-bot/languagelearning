@@ -1,13 +1,13 @@
-// 在线语音引擎：有道词典发音接口（国内直连，无需系统语音包）
-// 音频通过本地代理下载后存入 IndexedDB，读过的内容离线也能播
-// 若页面不是从本地服务器打开（无代理），退化为 <audio> 直连播放（无缓存）
+// 在线语音引擎：代理模式（Naver 整句 + 百度/有道兜底，带离线缓存）
+// 静态托管无代理时，直连百度翻译发音接口（页面已设 no-referrer，可跨域播放，无缓存）
 
 import type { LangCode } from './tts'
 
-const UPSTREAM = 'https://dict.youdao.com/dictvoice'
+// 百度翻译发音接口的语言代码
+const BAIDU_LAN: Record<LangCode, string> = { ko: 'kor', en: 'en', ja: 'jp', zh: 'zh' }
 
-function upstreamUrl(text: string, lang: LangCode): string {
-  return `${UPSTREAM}?audio=${encodeURIComponent(text)}&le=${lang}`
+function directUrl(text: string, lang: LangCode): string {
+  return `https://fanyi.baidu.com/gettts?lan=${BAIDU_LAN[lang]}&text=${encodeURIComponent(text)}&spd=3&source=web`
 }
 
 function proxyUrl(text: string, lang: LangCode, gender: string): string {
@@ -150,7 +150,7 @@ async function getPlayableUrl(text: string, lang: LangCode, gender: string): Pro
   }
 
   // 直连模式：地址交给 <audio>，失败由 onerror 捕获
-  return upstreamUrl(text, lang)
+  return directUrl(text, lang)
 }
 
 /** 播放一个音频地址；resolve(true)=正常播完或被停止，resolve(false)=加载失败 */

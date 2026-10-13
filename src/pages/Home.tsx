@@ -472,7 +472,7 @@ export default function Home() {
                 </Select>
               </div>
               <p className="mt-1 text-[11px] text-stone-400 leading-relaxed">
-                在线引擎（Naver Clova）整句自然发音，不依赖手机语音包，需要联网；
+                在线引擎（Naver / 百度）整句自然发音，不依赖手机语音包，需要联网；
                 读过的内容会缓存到本机，之后离线也能播。「自动」= 有系统语音用系统，没有就用在线。
               </p>
             </div>

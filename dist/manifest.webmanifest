@@ -1,0 +1,13 @@
+{
+  "name": "磨耳朵 · 随身听词本",
+  "short_name": "磨耳朵",
+  "description": "外语生词句子朗读复习本",
+  "start_url": "./",
+  "display": "standalone",
+  "background_color": "#FAF6EF",
+  "theme_color": "#FAF6EF",
+  "icons": [
+    { "src": "./icon-192.png", "sizes": "192x192", "type": "image/png" },
+    { "src": "./icon-512.png", "sizes": "512x512", "type": "image/png" }
+  ]
+}
