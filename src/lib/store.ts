@@ -5,6 +5,7 @@ export interface Entry {
   text: string
   lang: LangCode
   createdAt: number
+  starred?: boolean // 收藏标记
 }
 
 export interface Settings {
@@ -13,6 +14,8 @@ export interface Settings {
   rate: number // 语速 0.5 - 1.5
   repeat: number // 每条重复次数 1-3
   loop: boolean // 全部连播时是否循环
+  gap: number // 连播时条目之间的停顿秒数 0 - 2
+  loopOne: boolean // 跟读模式：点读单条时循环朗读直到手动停止
   voiceMap: Partial<Record<LangCode, string>> // 每种语言选择的系统 voiceURI，'auto' 或缺省为自动
 }
 
@@ -25,6 +28,8 @@ export const DEFAULT_SETTINGS: Settings = {
   rate: 0.9,
   repeat: 1,
   loop: false,
+  gap: 0.6,
+  loopOne: false,
   voiceMap: {},
 }
 
@@ -56,4 +61,70 @@ export function saveSettings(settings: Settings) {
 
 export function newId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+// ---------- 备份导出 / 导入 ----------
+
+export interface Backup {
+  app: 'moerduo'
+  version: 1
+  exportedAt: string
+  entries: Entry[]
+  settings: Settings
+}
+
+export function buildBackup(entries: Entry[], settings: Settings): string {
+  const payload: Backup = {
+    app: 'moerduo',
+    version: 1,
+    exportedAt: new Date().toISOString(),
+    entries,
+    settings,
+  }
+  return JSON.stringify(payload, null, 2)
+}
+
+const VALID_LANGS: LangCode[] = ['ko', 'en', 'ja', 'zh']
+
+function sanitizeEntry(raw: unknown, i: number): Entry | null {
+  if (typeof raw !== 'object' || raw === null) return null
+  const e = raw as Record<string, unknown>
+  if (typeof e.text !== 'string' || !e.text.trim()) return null
+  return {
+    id: typeof e.id === 'string' && e.id ? e.id : `${newId()}-${i}`,
+    text: e.text,
+    lang: VALID_LANGS.includes(e.lang as LangCode) ? (e.lang as LangCode) : 'en',
+    createdAt: typeof e.createdAt === 'number' ? e.createdAt : Date.now() + i,
+    starred: e.starred === true,
+  }
+}
+
+/**
+ * 解析备份文件内容。支持两种格式：
+ * 1. buildBackup 生成的完整备份（含设置）
+ * 2. 纯条目数组（旧版/手工编辑）
+ * 解析失败返回 null
+ */
+export function parseBackup(raw: string): { entries: Entry[]; settings?: Settings } | null {
+  try {
+    const data = JSON.parse(raw) as unknown
+    if (Array.isArray(data)) {
+      const entries = data.map(sanitizeEntry).filter((e): e is Entry => e !== null)
+      return entries.length > 0 ? { entries } : null
+    }
+    if (typeof data === 'object' && data !== null) {
+      const obj = data as Partial<Backup>
+      if (!Array.isArray(obj.entries)) return null
+      const entries = obj.entries.map(sanitizeEntry).filter((e): e is Entry => e !== null)
+      if (entries.length === 0) return null
+      const settings =
+        typeof obj.settings === 'object' && obj.settings !== null
+          ? { ...DEFAULT_SETTINGS, ...obj.settings }
+          : undefined
+      return { entries, settings }
+    }
+    return null
+  } catch {
+    return null
+  }
 }

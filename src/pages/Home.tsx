@@ -10,6 +10,10 @@ import {
   Copy,
   Check,
   Eraser,
+  Star,
+  Pencil,
+  Download,
+  Upload,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Slider } from '@/components/ui/slider'
@@ -41,12 +45,15 @@ import {
 import { LANGS, detectLang, langInfo, speakSmart, sleep, stopSpeaking } from '@/lib/tts'
 import type { Engine, LangCode } from '@/lib/tts'
 import { audioCacheCount, clearAudioCache } from '@/lib/onlineTts'
+import { edgeTtsUsable } from '@/lib/edgeTts'
 import {
   loadEntries,
   loadSettings,
   saveEntries,
   saveSettings,
   newId,
+  buildBackup,
+  parseBackup,
 } from '@/lib/store'
 import type { Entry, Settings } from '@/lib/store'
 import { useVoices } from '@/hooks/useVoices'
@@ -80,7 +87,14 @@ export default function Home() {
   const [sheetOpen, setSheetOpen] = useState(false)
   const [copied, setCopied] = useState(false)
   const [clipCount, setClipCount] = useState(0)
+  const [starOnly, setStarOnly] = useState(false)
+  const [editingId, setEditingId] = useState<string | null>(null)
+  const [editText, setEditText] = useState('')
+  const [importMsg, setImportMsg] = useState('')
+  const fileRef = useRef<HTMLInputElement>(null)
   const voices = useVoices()
+  // UA 不变，只检测一次：当前浏览器能否用 Edge 神经语音
+  const edgeUsable = useMemo(() => edgeTtsUsable(), [])
 
   // 打开设置时刷新语音缓存计数
   useEffect(() => {
@@ -95,15 +109,27 @@ export default function Home() {
   useEffect(() => saveEntries(entries), [entries])
   useEffect(() => saveSettings(settings), [settings])
 
+  // 导入结果提示 3 秒后自动消失
+  useEffect(() => {
+    if (!importMsg) return
+    const t = setTimeout(() => setImportMsg(''), 3000)
+    return () => clearTimeout(t)
+  }, [importMsg])
+
   // 页面卸载时停止朗读
   useEffect(() => () => stopSpeaking(), [])
 
-  /** 显示顺序：新的在前；搜索时过滤 */
+  /** 显示顺序：新的在前；支持收藏筛选 + 搜索过滤 */
   const visible = useMemo(() => {
     const q = query.trim().toLowerCase()
-    if (!q) return entries
-    return entries.filter((e) => e.text.toLowerCase().includes(q))
-  }, [entries, query])
+    return entries.filter(
+      (e) =>
+        (!starOnly || e.starred) &&
+        (!q || e.text.toLowerCase().includes(q)),
+    )
+  }, [entries, query, starOnly])
+
+  const starredCount = useMemo(() => entries.filter((e) => e.starred).length, [entries])
 
   /** 按日期分组（保持显示顺序） */
   const groups = useMemo(() => {
@@ -146,7 +172,7 @@ export default function Home() {
     return true
   }, [])
 
-  /** 朗读单条 */
+  /** 朗读单条；跟读模式下循环朗读直到手动停止 */
   const playOne = useCallback(
     async (entry: Entry) => {
       if (playingId === entry.id) {
@@ -157,8 +183,14 @@ export default function Home() {
       stopSpeaking()
       setPlayMode('single')
       setPlayingId(entry.id)
-      const ok = await speakEntry(entry, session)
-      if (ok && sessionRef.current === session) {
+      for (;;) {
+        const ok = await speakEntry(entry, session)
+        if (!ok || sessionRef.current !== session) return
+        if (!settingsRef.current.loopOne) break
+        await sleep(500)
+        if (sessionRef.current !== session) return
+      }
+      if (sessionRef.current === session) {
         setPlayingId(null)
         setPlayMode(null)
       }
@@ -183,7 +215,7 @@ export default function Home() {
         itemRefs.current.get(e.id)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
         const ok = await speakEntry(e, session)
         if (!ok || sessionRef.current !== session) return
-        await sleep(600)
+        await sleep(Math.max(0, settingsRef.current.gap) * 1000)
       }
     } while (settingsRef.current.loop && sessionRef.current === session)
     if (sessionRef.current === session) {
@@ -223,6 +255,73 @@ export default function Home() {
     const next = order[(order.indexOf(entry.lang) + 1) % order.length]
     setEntries((prev) => prev.map((e) => (e.id === entry.id ? { ...e, lang: next } : e)))
   }, [])
+
+  /** 收藏 / 取消收藏 */
+  const toggleStar = useCallback((entry: Entry) => {
+    setEntries((prev) =>
+      prev.map((e) => (e.id === entry.id ? { ...e, starred: !e.starred } : e)),
+    )
+  }, [])
+
+  /** 进入编辑：正在朗读该条时先停下 */
+  const startEdit = useCallback(
+    (entry: Entry) => {
+      if (playingId === entry.id) stopPlayback()
+      setEditingId(entry.id)
+      setEditText(entry.text)
+    },
+    [playingId, stopPlayback],
+  )
+
+  /** 保存编辑：文本变化后重新识别语言 */
+  const saveEdit = useCallback(() => {
+    const text = editText.trim()
+    const id = editingId
+    setEditingId(null)
+    if (!id || !text) return
+    setEntries((prev) =>
+      prev.map((e) =>
+        e.id === id && e.text !== text ? { ...e, text, lang: detectLang(text) } : e,
+      ),
+    )
+  }, [editText, editingId])
+
+  /** 导出备份（条目 + 设置）为 JSON 文件 */
+  const exportBackup = useCallback(() => {
+    const blob = new Blob([buildBackup(entries, settings)], {
+      type: 'application/json',
+    })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement('a')
+    const d = new Date()
+    const stamp = `${d.getFullYear()}${String(d.getMonth() + 1).padStart(2, '0')}${String(d.getDate()).padStart(2, '0')}`
+    a.href = url
+    a.download = `磨耳朵备份-${stamp}.json`
+    a.click()
+    setTimeout(() => URL.revokeObjectURL(url), 5000)
+  }, [entries, settings])
+
+  /** 导入备份：覆盖当前条目（和备份里的设置） */
+  const importBackup = useCallback(
+    (file: File) => {
+      const reader = new FileReader()
+      reader.onload = () => {
+        const parsed = parseBackup(String(reader.result ?? ''))
+        if (!parsed) {
+          setImportMsg('文件格式不对，导入失败')
+          return
+        }
+        stopPlayback()
+        setEntries(parsed.entries)
+        if (parsed.settings) setSettings(parsed.settings)
+        setEditingId(null)
+        setImportMsg(`已导入 ${parsed.entries.length} 条（覆盖了原列表）`)
+      }
+      reader.onerror = () => setImportMsg('文件读取失败')
+      reader.readAsText(file)
+    },
+    [stopPlayback],
+  )
 
   const clearAll = useCallback(() => {
     stopPlayback()
@@ -311,16 +410,33 @@ export default function Home() {
           </div>
         </div>
 
-        {/* 搜索 */}
-        {entries.length > 5 && (
-          <div className="mt-3 flex items-center gap-2 rounded-full bg-white border border-stone-200/60 px-3 py-2">
-            <Search className="h-4 w-4 text-stone-400 shrink-0" />
-            <input
-              value={query}
-              onChange={(e) => setQuery(e.target.value)}
-              placeholder="搜索…"
-              className="w-full bg-transparent text-sm outline-none placeholder:text-stone-400"
-            />
+        {/* 搜索 + 收藏筛选 */}
+        {(entries.length > 5 || starredCount > 0) && (
+          <div className="mt-3 flex items-center gap-2">
+            {entries.length > 5 && (
+              <div className="flex flex-1 items-center gap-2 rounded-full bg-white border border-stone-200/60 px-3 py-2">
+                <Search className="h-4 w-4 text-stone-400 shrink-0" />
+                <input
+                  value={query}
+                  onChange={(e) => setQuery(e.target.value)}
+                  placeholder="搜索…"
+                  className="w-full bg-transparent text-sm outline-none placeholder:text-stone-400"
+                />
+              </div>
+            )}
+            {starredCount > 0 && (
+              <button
+                onClick={() => setStarOnly((v) => !v)}
+                className={`flex shrink-0 items-center gap-1 rounded-full border px-3 py-2 text-xs transition-colors ${
+                  starOnly
+                    ? 'border-amber-300 bg-amber-100 text-amber-700'
+                    : 'border-stone-200/60 bg-white text-stone-500 hover:bg-stone-50'
+                }`}
+              >
+                <Star className={`h-3.5 w-3.5 ${starOnly ? 'fill-current' : ''}`} />
+                收藏 {starredCount}
+              </button>
+            )}
           </div>
         )}
 
@@ -379,26 +495,85 @@ export default function Home() {
                             <Volume2 className="h-5 w-5" />
                           )}
                         </button>
-                        <div
-                          className="min-w-0 flex-1 cursor-pointer"
-                          onClick={() => playOne(entry)}
-                        >
-                          <p className={`break-words leading-snug ${sizeClass}`}>
-                            {entry.text}
-                          </p>
-                          <div className="mt-1 flex items-center gap-1.5 text-[11px] text-stone-400">
-                            <button
-                              onClick={(e) => {
-                                e.stopPropagation()
-                                cycleLang(entry)
-                              }}
-                              className="rounded-full bg-stone-100 px-1.5 py-0.5 hover:bg-stone-200 active:bg-stone-300 transition-colors"
-                              title="识别不准？点按切换语言"
+                        <div className="min-w-0 flex-1">
+                          {editingId === entry.id ? (
+                            <div>
+                              <textarea
+                                value={editText}
+                                onChange={(e) => setEditText(e.target.value)}
+                                rows={2}
+                                autoFocus
+                                className="w-full resize-none rounded-lg bg-stone-50 p-2 text-[15px] leading-relaxed outline-none focus:ring-2 focus:ring-[#E85D3D]/30"
+                                onKeyDown={(e) => {
+                                  if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) saveEdit()
+                                  if (e.key === 'Escape') setEditingId(null)
+                                }}
+                              />
+                              <div className="mt-1.5 flex justify-end gap-2">
+                                <button
+                                  onClick={() => setEditingId(null)}
+                                  className="rounded-full px-3 py-1 text-xs text-stone-500 hover:bg-stone-100"
+                                >
+                                  取消
+                                </button>
+                                <button
+                                  onClick={saveEdit}
+                                  disabled={!editText.trim()}
+                                  className="rounded-full bg-stone-800 px-3 py-1 text-xs text-white disabled:opacity-40"
+                                >
+                                  保存
+                                </button>
+                              </div>
+                            </div>
+                          ) : (
+                            <div
+                              className="cursor-pointer"
+                              onClick={() => playOne(entry)}
                             >
-                              {lang.flag} {lang.name}
-                            </button>
-                            <span>· {timeLabel(entry.createdAt)}</span>
-                          </div>
+                              <p className={`break-words leading-snug ${sizeClass}`}>
+                                {entry.text}
+                              </p>
+                              <div className="mt-1 flex items-center gap-1.5 text-[11px] text-stone-400">
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    cycleLang(entry)
+                                  }}
+                                  className="rounded-full bg-stone-100 px-1.5 py-0.5 hover:bg-stone-200 active:bg-stone-300 transition-colors"
+                                  title="识别不准？点按切换语言"
+                                >
+                                  {lang.flag} {lang.name}
+                                </button>
+                                <span>· {timeLabel(entry.createdAt)}</span>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    toggleStar(entry)
+                                  }}
+                                  aria-label={entry.starred ? '取消收藏' : '收藏'}
+                                  className={`rounded-full p-1 transition-colors ${
+                                    entry.starred
+                                      ? 'text-amber-500'
+                                      : 'text-stone-300 hover:text-amber-400'
+                                  }`}
+                                >
+                                  <Star
+                                    className={`h-3.5 w-3.5 ${entry.starred ? 'fill-current' : ''}`}
+                                  />
+                                </button>
+                                <button
+                                  onClick={(e) => {
+                                    e.stopPropagation()
+                                    startEdit(entry)
+                                  }}
+                                  aria-label="编辑"
+                                  className="rounded-full p-1 text-stone-300 hover:text-stone-500 transition-colors"
+                                >
+                                  <Pencil className="h-3.5 w-3.5" />
+                                </button>
+                              </div>
+                            </div>
+                          )}
                         </div>
                         <button
                           onClick={() => removeEntry(entry.id)}
@@ -472,8 +647,19 @@ export default function Home() {
                 </Select>
               </div>
               <p className="mt-1 text-[11px] text-stone-400 leading-relaxed">
-                在线引擎（Naver / 百度）整句自然发音，不依赖手机语音包，需要联网；
+                在线引擎整句自然发音，不依赖手机语音包，需要联网；
                 读过的内容会缓存到本机，之后离线也能播。「自动」= 有系统语音用系统，没有就用在线。
+              </p>
+              <p
+                className={`mt-1.5 rounded-lg px-2 py-1.5 text-[11px] leading-relaxed ${
+                  edgeUsable
+                    ? 'bg-emerald-50 text-emerald-600'
+                    : 'bg-amber-50 text-amber-600'
+                }`}
+              >
+                {edgeUsable
+                  ? '✓ 当前是 Edge 浏览器：在线发音使用微软神经语音，音质最佳，免费直连'
+                  : '当前浏览器将用百度发音。用手机 Edge 浏览器（免费）打开本页，可解锁微软神经语音，音质更好'}
               </p>
             </div>
 
@@ -540,6 +726,39 @@ export default function Home() {
               <Switch
                 checked={settings.loop}
                 onCheckedChange={(v) => setSettings((s) => ({ ...s, loop: v }))}
+              />
+            </div>
+
+            {/* 连播间隔 */}
+            <div>
+              <div className="mb-2 flex items-center justify-between">
+                <label className="text-sm font-medium">连播间隔</label>
+                <span className="text-sm text-stone-500">{settings.gap.toFixed(1)} 秒</span>
+              </div>
+              <Slider
+                value={[settings.gap]}
+                min={0}
+                max={2}
+                step={0.1}
+                onValueChange={([v]) => setSettings((s) => ({ ...s, gap: v }))}
+              />
+              <div className="mt-1 flex justify-between text-[11px] text-stone-400">
+                <span>紧凑</span>
+                <span>留白 · 跟读回味</span>
+              </div>
+            </div>
+
+            {/* 单条复读 */}
+            <div className="flex items-center justify-between">
+              <div>
+                <label className="text-sm font-medium">跟读模式</label>
+                <p className="text-[11px] text-stone-400">
+                  点读单条时循环朗读，再点一次停止
+                </p>
+              </div>
+              <Switch
+                checked={settings.loopOne}
+                onCheckedChange={(v) => setSettings((s) => ({ ...s, loopOne: v }))}
               />
             </div>
 
@@ -650,8 +869,41 @@ export default function Home() {
                   </AlertDialogContent>
                 </AlertDialog>
               </div>
+              <div className="flex gap-2">
+                <Button
+                  variant="outline"
+                  className="flex-1"
+                  onClick={exportBackup}
+                  disabled={entries.length === 0}
+                >
+                  <Download className="h-4 w-4 mr-1" />
+                  导出备份
+                </Button>
+                <Button
+                  variant="outline"
+                  className="flex-1"
+                  onClick={() => fileRef.current?.click()}
+                >
+                  <Upload className="h-4 w-4 mr-1" />
+                  导入备份
+                </Button>
+                <input
+                  ref={fileRef}
+                  type="file"
+                  accept="application/json,.json"
+                  className="hidden"
+                  onChange={(e) => {
+                    const f = e.target.files?.[0]
+                    if (f) importBackup(f)
+                    e.target.value = ''
+                  }}
+                />
+              </div>
+              {importMsg && (
+                <p className="text-[11px] text-stone-500">{importMsg}</p>
+              )}
               <p className="text-[11px] text-stone-400">
-                数据保存在本机浏览器中，不会上传。
+                数据保存在本机浏览器中，不会上传。备份文件含条目和设置，导入会覆盖当前列表。
               </p>
             </div>
           </div>

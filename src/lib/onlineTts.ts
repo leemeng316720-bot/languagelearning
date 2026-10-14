@@ -1,7 +1,8 @@
-// 在线语音引擎：代理模式（Naver 整句 + 百度/有道兜底，带离线缓存）
-// 静态托管无代理时，直连百度翻译发音接口（页面已设 no-referrer，可跨域播放，无缓存）
+// 在线语音引擎：Edge 神经语音（Edge 系浏览器直连，无需中转）→ 本地代理（Naver 整句 + 百度/有道兜底，带离线缓存）
+// 静态托管无代理且非 Edge 浏览器时，直连百度翻译发音接口（页面已设 no-referrer，可跨域播放，无缓存）
 
 import type { LangCode } from './tts'
+import { edgeTtsSpeak, edgeTtsUsable, resetEdgeTts, stopEdgeTts } from './edgeTts'
 
 // 百度翻译发音接口的语言代码
 const BAIDU_LAN: Record<LangCode, string> = { ko: 'kor', en: 'en', ja: 'jp', zh: 'zh' }
@@ -85,11 +86,14 @@ let settle: ((ok: boolean) => void) | null = null
 let curFetch: AbortController | null = null
 /** 代理是否可用（页面不从本地服务器打开时不可用） */
 let proxyDown = false
+/** Edge TTS 是否可用（UA 是 Edge 系且接口未被封） */
+let edgeOk = edgeTtsUsable()
 /** 已生成的 objectURL，避免重复创建 */
 const urlCache = new Map<string, string>()
 
 export function stopOnlineSpeaking() {
   stopFlag = true
+  stopEdgeTts()
   try {
     curFetch?.abort()
   } catch {
@@ -110,7 +114,7 @@ export function stopOnlineSpeaking() {
 
 /**
  * 获取一段文字的可播放地址：
- * 本机缓存 → 本地代理下载（并写入缓存）→ 直连（无缓存）
+ * 本机缓存 → Edge 神经语音（Edge 系浏览器，合成结果写入缓存）→ 本地代理下载（并写入缓存）→ 直连（无缓存）
  * 返回 null 表示这段文字拿不到发音（触发上层逐词降级）
  */
 async function getPlayableUrl(text: string, lang: LangCode, gender: string): Promise<string | null> {
@@ -123,6 +127,21 @@ async function getPlayableUrl(text: string, lang: LangCode, gender: string): Pro
     const url = URL.createObjectURL(cached)
     urlCache.set(key, url)
     return url
+  }
+
+  // Edge 神经语音：音质最佳，浏览器直连 WebSocket，无需中转
+  if (edgeOk && !stopFlag) {
+    try {
+      const blob = await edgeTtsSpeak(text, lang, gender)
+      if (stopFlag) return null
+      const url = URL.createObjectURL(blob)
+      urlCache.set(key, url)
+      void idbPut(key, blob) // 后台落盘，离线也能播
+      return url
+    } catch {
+      if (stopFlag) return null
+      edgeOk = false // 网络不通或接口变动，本次会话降级
+    }
   }
 
   if (!proxyDown) {
@@ -140,7 +159,7 @@ async function getPlayableUrl(text: string, lang: LangCode, gender: string): Pro
       }
       if (res.status === 502) return null // 上游确实没有这段发音
       proxyDown = true // 代理不存在（静态部署等情况）
-    } catch (e) {
+    } catch {
       if (stopFlag) return null
       // 网络错误或代理不存在，降级直连
       proxyDown = true
@@ -219,7 +238,7 @@ async function speakSegment(
 }
 
 /**
- * 在线朗读（代理内 Naver 整句优先，有道词条兜底）。
+ * 在线朗读（Edge 神经语音优先，其次代理内 Naver 整句 / 百度直连）。
  * 整段失败时自动降级为逐词朗读；韩语单词失败会剥词尾助词再试；
  * 连单个词都失败则抛错，由上层回退到系统语音。
  */
@@ -228,6 +247,7 @@ export async function speakOnline(
   opts: { lang: LangCode; rate: number; gender: string },
 ): Promise<void> {
   stopFlag = false
+  resetEdgeTts()
   const ok = await speakSegment(text, opts)
   if (stopFlag || ok) return
   const words = text
