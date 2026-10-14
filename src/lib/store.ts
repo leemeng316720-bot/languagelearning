@@ -16,6 +16,7 @@ export interface Settings {
   loop: boolean // 全部连播时是否循环
   gap: number // 连播时条目之间的停顿秒数 0 - 2
   loopOne: boolean // 跟读模式：点读单条时循环朗读直到手动停止
+  wakeLock: boolean // 连播时保持屏幕常亮，防止息屏中断
   voiceMap: Partial<Record<LangCode, string>> // 每种语言选择的系统 voiceURI，'auto' 或缺省为自动
 }
 
@@ -30,6 +31,7 @@ export const DEFAULT_SETTINGS: Settings = {
   loop: false,
   gap: 0.6,
   loopOne: false,
+  wakeLock: true,
   voiceMap: {},
 }
 
@@ -61,6 +63,32 @@ export function saveSettings(settings: Settings) {
 
 export function newId(): string {
   return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 8)}`
+}
+
+// ---------- 连播断点 ----------
+
+export interface ResumePoint {
+  entryId: string
+  savedAt: number
+}
+
+const RESUME_KEY = 'moerduo.resume.v1'
+
+export function loadResume(): ResumePoint | null {
+  try {
+    const raw = localStorage.getItem(RESUME_KEY)
+    return raw ? (JSON.parse(raw) as ResumePoint) : null
+  } catch {
+    return null
+  }
+}
+
+export function saveResume(p: ResumePoint) {
+  localStorage.setItem(RESUME_KEY, JSON.stringify(p))
+}
+
+export function clearResume() {
+  localStorage.removeItem(RESUME_KEY)
 }
 
 // ---------- 备份导出 / 导入 ----------

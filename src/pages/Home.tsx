@@ -14,6 +14,8 @@ import {
   Pencil,
   Download,
   Upload,
+  RotateCcw,
+  X,
 } from 'lucide-react'
 import { Button } from '@/components/ui/button'
 import { Slider } from '@/components/ui/slider'
@@ -54,8 +56,11 @@ import {
   newId,
   buildBackup,
   parseBackup,
+  loadResume,
+  saveResume,
+  clearResume,
 } from '@/lib/store'
-import type { Entry, Settings } from '@/lib/store'
+import type { Entry, ResumePoint, Settings } from '@/lib/store'
 import { useVoices } from '@/hooks/useVoices'
 
 function dayLabel(ts: number): string {
@@ -91,10 +96,16 @@ export default function Home() {
   const [editingId, setEditingId] = useState<string | null>(null)
   const [editText, setEditText] = useState('')
   const [importMsg, setImportMsg] = useState('')
+  const [resume, setResume] = useState<ResumePoint | null>(() => loadResume())
   const fileRef = useRef<HTMLInputElement>(null)
   const voices = useVoices()
   // UA 不变，只检测一次：当前浏览器能否用 Edge 神经语音
   const edgeUsable = useMemo(() => edgeTtsUsable(), [])
+
+  /** 连播心跳：每开始一条刷新，用于检测息屏后 JS 被系统挂起 */
+  const heartbeatRef = useRef(0)
+  /** 屏幕常亮句柄（Wake Lock） */
+  const wakeLockRef = useRef<{ release: () => Promise<void> } | null>(null)
 
   // 打开设置时刷新语音缓存计数
   useEffect(() => {
@@ -148,12 +159,54 @@ export default function Home() {
     [entries],
   )
 
+  /** 更新连播断点（state + localStorage 双写，页面被回收后也能找回） */
+  const setResumePoint = useCallback((p: ResumePoint | null) => {
+    setResume(p)
+    if (p) saveResume(p)
+    else clearResume()
+  }, [])
+
+  /** 连播时请求屏幕常亮（不支持/被拒绝时静默忽略） */
+  const acquireWakeLock = useCallback(async () => {
+    if (!settingsRef.current.wakeLock) return
+    try {
+      const nav = navigator as Navigator & {
+        wakeLock?: { request: (type: string) => Promise<{ release: () => Promise<void> }> }
+      }
+      if (!nav.wakeLock || wakeLockRef.current) return
+      wakeLockRef.current = await nav.wakeLock.request('screen')
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
+  const releaseWakeLock = useCallback(() => {
+    wakeLockRef.current?.release().catch(() => undefined)
+    wakeLockRef.current = null
+  }, [])
+
+  /** 锁屏/通知栏媒体卡片显示当前条目 */
+  const setMediaMeta = useCallback((e: Entry) => {
+    if (!('mediaSession' in navigator)) return
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title: e.text.length > 40 ? `${e.text.slice(0, 40)}…` : e.text,
+        artist: '磨耳朵',
+        album: langInfo(e.lang).name,
+      })
+    } catch {
+      /* ignore */
+    }
+  }, [])
+
   const stopPlayback = useCallback(() => {
     sessionRef.current++
     stopSpeaking()
     setPlayingId(null)
     setPlayMode(null)
-  }, [])
+    setResumePoint(null) // 用户主动停止，没有断点
+    releaseWakeLock()
+  }, [setResumePoint, releaseWakeLock])
 
   const speakEntry = useCallback(async (entry: Entry, session: number) => {
     const s = settingsRef.current
@@ -183,6 +236,7 @@ export default function Home() {
       stopSpeaking()
       setPlayMode('single')
       setPlayingId(entry.id)
+      setMediaMeta(entry)
       for (;;) {
         const ok = await speakEntry(entry, session)
         if (!ok || sessionRef.current !== session) return
@@ -195,34 +249,95 @@ export default function Home() {
         setPlayMode(null)
       }
     },
-    [playingId, speakEntry, stopPlayback],
+    [playingId, speakEntry, stopPlayback, setMediaMeta],
   )
 
-  /** 全部连播 */
-  const playAll = useCallback(async () => {
-    if (playMode === 'all') {
-      stopPlayback()
-      return
-    }
-    if (visible.length === 0) return
-    const session = ++sessionRef.current
-    stopSpeaking()
-    setPlayMode('all')
-    do {
-      for (const e of visible) {
-        if (sessionRef.current !== session) return
-        setPlayingId(e.id)
-        itemRefs.current.get(e.id)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
-        const ok = await speakEntry(e, session)
-        if (!ok || sessionRef.current !== session) return
-        await sleep(Math.max(0, settingsRef.current.gap) * 1000)
+  /** 全部连播；传 startId 则从该条开始（断点续播） */
+  const playAll = useCallback(
+    async (startId?: string) => {
+      if (playMode === 'all' && !startId) {
+        stopPlayback()
+        return
       }
-    } while (settingsRef.current.loop && sessionRef.current === session)
-    if (sessionRef.current === session) {
-      setPlayingId(null)
-      setPlayMode(null)
+      if (visible.length === 0) return
+      const startIdx = startId
+        ? Math.max(0, visible.findIndex((e) => e.id === startId))
+        : 0
+      const session = ++sessionRef.current
+      stopSpeaking()
+      setPlayMode('all')
+      void acquireWakeLock()
+      heartbeatRef.current = Date.now()
+      let firstRound = true
+      do {
+        const items = firstRound ? visible.slice(startIdx) : visible
+        firstRound = false
+        for (const e of items) {
+          if (sessionRef.current !== session) return
+          heartbeatRef.current = Date.now()
+          setResumePoint({ entryId: e.id, savedAt: Date.now() })
+          setMediaMeta(e)
+          setPlayingId(e.id)
+          itemRefs.current.get(e.id)?.scrollIntoView({ behavior: 'smooth', block: 'center' })
+          const ok = await speakEntry(e, session)
+          if (!ok || sessionRef.current !== session) return
+          await sleep(Math.max(0, settingsRef.current.gap) * 1000)
+        }
+      } while (settingsRef.current.loop && sessionRef.current === session)
+      if (sessionRef.current === session) {
+        setPlayingId(null)
+        setPlayMode(null)
+        setResumePoint(null) // 完整播完，没有断点
+        releaseWakeLock()
+      }
+    },
+    [playMode, visible, speakEntry, stopPlayback, acquireWakeLock, releaseWakeLock, setResumePoint, setMediaMeta],
+  )
+
+  // 息屏/切后台后回到页面：重新申请常亮；若播放链已被系统挂死则复位，露出断点续播条
+  useEffect(() => {
+    const onVis = () => {
+      if (document.visibilityState !== 'visible') return
+      if (playMode !== 'all') return
+      wakeLockRef.current = null // 息屏时系统已自动释放，清掉句柄重新申请
+      void acquireWakeLock()
+      if (Date.now() - heartbeatRef.current > 90_000) {
+        sessionRef.current++
+        stopSpeaking()
+        setPlayingId(null)
+        setPlayMode(null)
+        releaseWakeLock()
+      }
     }
-  }, [playMode, visible, speakEntry, stopPlayback])
+    document.addEventListener('visibilitychange', onVis)
+    return () => document.removeEventListener('visibilitychange', onVis)
+  }, [playMode, acquireWakeLock, releaseWakeLock])
+
+  // 锁屏/通知栏媒体控制：暂停、上一条、下一条、继续
+  useEffect(() => {
+    if (!('mediaSession' in navigator)) return
+    const ms = navigator.mediaSession
+    const skip = (dir: 1 | -1) => {
+      if (!playingId) return
+      const i = visible.findIndex((e) => e.id === playingId)
+      const target = visible[i + dir]
+      if (!target) return
+      if (playMode === 'all') void playAll(target.id)
+      else void playOne(target)
+    }
+    try {
+      ms.setActionHandler('pause', stopPlayback)
+      ms.setActionHandler('stop', stopPlayback)
+      ms.setActionHandler('play', () => {
+        const r = loadResume()
+        if (r) void playAll(r.entryId)
+      })
+      ms.setActionHandler('previoustrack', () => skip(-1))
+      ms.setActionHandler('nexttrack', () => skip(1))
+    } catch {
+      /* ignore */
+    }
+  }, [visible, playingId, playMode, playAll, playOne, stopPlayback])
 
   const addEntries = useCallback(() => {
     const lines = input
@@ -344,6 +459,7 @@ export default function Home() {
   }, [entries])
 
   const playingIndex = playingId ? visible.findIndex((e) => e.id === playingId) : -1
+  const resumeEntry = resume ? entries.find((e) => e.id === resume.entryId) : undefined
 
   return (
     <div className="min-h-screen bg-[#FAF6EF] text-stone-800">
@@ -369,7 +485,7 @@ export default function Home() {
             <Button
               size="icon"
               className="rounded-full bg-[#E85D3D] hover:bg-[#d14e31] text-white shadow-md disabled:opacity-40"
-              onClick={playAll}
+              onClick={() => void playAll()}
               disabled={visible.length === 0}
               aria-label={playMode === 'all' ? '停止连播' : '全部连播'}
             >
@@ -592,6 +708,38 @@ export default function Home() {
         )}
       </div>
 
+      {/* 断点续播条：连播被息屏打断、或页面被系统回收后回来时显示 */}
+      {resume && playMode === null && (
+        <div className="fixed inset-x-0 bottom-0 z-10 border-t border-stone-200 bg-white/95 backdrop-blur">
+          <div className="mx-auto flex max-w-md items-center gap-3 px-4 py-3">
+            <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-600">
+              <RotateCcw className="h-4 w-4" />
+            </span>
+            <div className="min-w-0 flex-1">
+              <p className="truncate text-sm font-medium">
+                {resumeEntry ? resumeEntry.text : '该条已删除，将从头播放'}
+              </p>
+              <p className="text-[11px] text-stone-400">连播中断 · 从断点继续</p>
+            </div>
+            <Button
+              size="sm"
+              className="rounded-full bg-[#E85D3D] hover:bg-[#d14e31] text-white"
+              onClick={() => void playAll(resume.entryId)}
+            >
+              <Play className="h-3.5 w-3.5 fill-current mr-1" />
+              继续
+            </Button>
+            <button
+              aria-label="忽略断点"
+              className="shrink-0 rounded-full p-1.5 text-stone-300 hover:text-stone-500 transition-colors"
+              onClick={() => setResumePoint(null)}
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        </div>
+      )}
+
       {/* 连播底部状态栏 */}
       {playMode === 'all' && playingId && (
         <div className="fixed inset-x-0 bottom-0 z-10 border-t border-stone-200 bg-white/95 backdrop-blur">
@@ -759,6 +907,20 @@ export default function Home() {
               <Switch
                 checked={settings.loopOne}
                 onCheckedChange={(v) => setSettings((s) => ({ ...s, loopOne: v }))}
+              />
+            </div>
+
+            {/* 屏幕常亮 */}
+            <div className="flex items-center justify-between">
+              <div>
+                <label className="text-sm font-medium">连播时屏幕常亮</label>
+                <p className="text-[11px] text-stone-400">
+                  防止息屏中断；手动锁屏后回来可从断点继续
+                </p>
+              </div>
+              <Switch
+                checked={settings.wakeLock}
+                onCheckedChange={(v) => setSettings((s) => ({ ...s, wakeLock: v }))}
               />
             </div>
 
