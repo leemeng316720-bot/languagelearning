@@ -1,6 +1,7 @@
 // 语音朗读与语言识别工具
 
 import { speakOnline, stopOnlineSpeaking } from './onlineTts'
+import { edgeTtsUsable } from './edgeTts'
 
 export type LangCode = 'ko' | 'en' | 'ja' | 'zh'
 
@@ -55,7 +56,7 @@ export function extractSpeakText(text: string, lang: LangCode): string {
   if (lang === 'zh') return text
   if (lang === 'ko' || lang === 'en') {
     const stripped = text
-      .replace(/[一-鿿　-〿＀-￯]/g, ' ')
+      .replace(/[一-鿿\u3000-\u303f\uff00-\uffef]/g, ' ')
       .replace(/\s+/g, ' ')
       .trim()
     return stripped || text
@@ -117,8 +118,11 @@ export async function speakSmart(
   opts: { lang: LangCode; rate: number; engine: Engine; voiceURI?: string; gender?: string },
 ): Promise<void> {
   const hasSystemVoice = pickVoice(opts.lang, opts.voiceURI) !== null
+  // 自动模式：Edge 浏览器内优先在线神经语音（语速可靠、音质更好）；
+  // 非 Edge 时优先系统语音（省流量、离线可用），没有系统语音再走在线
   const preferOnline =
-    opts.engine === 'online' || (opts.engine === 'auto' && !hasSystemVoice)
+    opts.engine === 'online' ||
+    (opts.engine === 'auto' && (edgeTtsUsable() || !hasSystemVoice))
   if (preferOnline) {
     try {
       await speakOnline(extractSpeakText(text, opts.lang), {

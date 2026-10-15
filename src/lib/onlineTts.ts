@@ -178,6 +178,7 @@ function playClip(url: string, rate: number): Promise<boolean> {
     const audio = new Audio()
     curAudio = audio
     audio.preload = 'auto'
+    audio.defaultPlaybackRate = rate
     audio.playbackRate = rate
     settle = (ok) => {
       settle = null

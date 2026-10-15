@@ -796,7 +796,8 @@ export default function Home() {
               </div>
               <p className="mt-1 text-[11px] text-stone-400 leading-relaxed">
                 在线引擎整句自然发音，不依赖手机语音包，需要联网；
-                读过的内容会缓存到本机，之后离线也能播。「自动」= 有系统语音用系统，没有就用在线。
+                读过的内容会缓存到本机，之后离线也能播。
+                「自动」= Edge 浏览器内用神经语音（语速可控），其他浏览器优先系统语音。
               </p>
               <p
                 className={`mt-1.5 rounded-lg px-2 py-1.5 text-[11px] leading-relaxed ${
@@ -832,7 +833,31 @@ export default function Home() {
             <div>
               <div className="mb-2 flex items-center justify-between">
                 <label className="text-sm font-medium">语速</label>
-                <span className="text-sm text-stone-500">{settings.rate.toFixed(2)}x</span>
+                <div className="flex items-center gap-2">
+                  <span className="text-sm text-stone-500">{settings.rate.toFixed(2)}x</span>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    className="h-7 rounded-full px-3 text-xs"
+                    onClick={() => {
+                      const text = visible[0]?.text ?? '안녕하세요 · 你好'
+                      const lang = detectLang(text)
+                      const s = settingsRef.current
+                      sessionRef.current++
+                      stopSpeaking()
+                      void speakSmart(text, {
+                        lang,
+                        rate: s.rate,
+                        engine: s.engine,
+                        voiceURI: s.voiceMap[lang],
+                        gender: s.voiceGender,
+                      })
+                    }}
+                  >
+                    <Volume2 className="h-3 w-3 mr-1" />
+                    试听
+                  </Button>
+                </div>
               </div>
               <Slider
                 value={[settings.rate]}
@@ -845,6 +870,10 @@ export default function Home() {
                 <span>慢 · 跟读</span>
                 <span>快 · 磨耳朵</span>
               </div>
+              <p className="mt-1.5 text-[11px] text-stone-400 leading-relaxed">
+                系统语音在部分手机（如 iPhone 高质量音色）上会忽略语速；
+                若试听无效，把朗读引擎切到「在线优先」即可。
+              </p>
             </div>
 
             {/* 重复次数 */}
